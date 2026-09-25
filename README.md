@@ -2,6 +2,8 @@
 
 A first-generation Baidu Kunlun card (`1d22:3684`, KL1, two dies). This repo is the setup guide, the clock tool, and the GEMM numbers for that card.
 
+![K200 card image](./K200.png)
+
 Start with the [glossary](docs/glossary.md) if the names are new. Use Ubuntu **22.04** and a **6.8** kernel. Ubuntu 24.04, XRE 5, and R200 / P800 wheels are a later chip.
 
 ## What works
