@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Drive motherboard PWM from Kunlun K200 die temperature.
+
+fancontrol cannot follow XPU temp (kunlun.ko has no hwmon). This reads
+`xpu_smi -m` and writes IT8688 pwmN_enable/pwmN.
+"""
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CONF_PATH = Path("/etc/k200-fancontrol.conf")
+HWMON_ROOT = Path("/sys/class/hwmon")
+
+DEFAULTS = {
+    "PWM": "3",
+    "TEMP_MIN": "52",
+    "TEMP_MAX": "78",
+    "PWM_MIN": "90",
+    "PWM_MAX": "255",
+    "HYST": "2",
+    "INTERVAL": "2",
+    "PWM_FAILSAFE": "220",
+    "XPU_SMI": "/usr/local/xpu-4.33.0/bin/xpu_smi",
+}
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def load_conf() -> dict[str, str]:
+    cfg = dict(DEFAULTS)
+    if CONF_PATH.exists():
+        for raw in CONF_PATH.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            cfg[key.strip()] = val.strip()
+    return cfg
+
+
+def find_it8688() -> Path:
+    for hw in sorted(HWMON_ROOT.glob("hwmon*")):
+        name = hw.joinpath("name")
+        if name.exists() and name.read_text(encoding="ascii").strip() == "it8688":
+            return hw
+    raise FileNotFoundError("it8688 hwmon not found (is the frankcrawford it87 module loaded?)")
+
+
+def sysfs_write(path: Path, value: str) -> None:
+    with path.open("w", encoding="ascii") as fh:
+        fh.write(value)
+
+
+def sysfs_read(path: Path) -> str:
+    return path.read_text(encoding="ascii").strip()
+
+
+def parse_pwms(spec: str) -> list[int]:
+    out: list[int] = []
+    for part in spec.replace(" ", "").split(","):
+        if not part:
+            continue
+        n = int(part)
+        if n < 1 or n > 5:
+            raise ValueError(f"PWM index {n} out of range 1-5")
+        out.append(n)
+    if not out:
+        raise ValueError("PWM list is empty")
+    return out
+
+
+def xpu_temps(xpu_smi: str) -> list[int]:
+    env = os.environ.copy()
+    bindir = str(Path(xpu_smi).parent)
+    env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    proc = subprocess.run(
+        [xpu_smi, "-m"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=8,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"xpu_smi -m failed ({proc.returncode}): {err}")
+    temps: list[int] = []
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        try:
+            temps.append(int(parts[4]))
+        except ValueError:
+            continue
+    if not temps:
+        raise RuntimeError("xpu_smi -m returned no temperatures")
+    return temps
+
+
+def duty_for_temp(temp: float, tmin: float, tmax: float, pwm_min: int, pwm_max: int) -> int:
+    if tmax <= tmin:
+        return pwm_max
+    if temp <= tmin:
+        return pwm_min
+    if temp >= tmax:
+        return pwm_max
+    ratio = (temp - tmin) / (tmax - tmin)
+    return int(round(pwm_min + ratio * (pwm_max - pwm_min)))
+
+
+class FanController:
+    def __init__(self, cfg: dict[str, str]) -> None:
+        self.cfg = cfg
+        self.hwmon = find_it8688()
+        self.pwms = parse_pwms(cfg["PWM"])
+        self.tmin = float(cfg["TEMP_MIN"])
+        self.tmax = float(cfg["TEMP_MAX"])
+        self.pwm_min = int(cfg["PWM_MIN"])
+        self.pwm_max = int(cfg["PWM_MAX"])
+        self.hyst = float(cfg["HYST"])
+        self.interval = float(cfg["INTERVAL"])
+        self.failsafe = int(cfg["PWM_FAILSAFE"])
+        self.xpu_smi = cfg["XPU_SMI"]
+        self.prev_duty: dict[int, int] = {}
+        self.applied: int | None = None
+        self._stop = False
+
+    def request_stop(self, *_args: object) -> None:
+        self._stop = True
+
+    def set_duty(self, duty: int, reason: str) -> None:
+        duty = max(0, min(255, duty))
+        for idx in self.pwms:
+            enable = self.hwmon / f"pwm{idx}_enable"
+            pwm = self.hwmon / f"pwm{idx}"
+            # Manual mode. IT8688 sometimes reads back 0 after writing 1;
+            # rewriting every cycle keeps BIOS Smart Fan from taking over.
+            sysfs_write(enable, "1")
+            sysfs_write(pwm, str(duty))
+            rpm = sysfs_read(self.hwmon / f"fan{idx}_input")
+            prev = self.prev_duty.get(idx)
+            if prev != duty:
+                log(f"{reason}: pwm{idx}={duty} rpm={rpm}")
+            self.prev_duty[idx] = duty
+        self.applied = duty
+
+    def restore_bios(self) -> None:
+        for idx in self.pwms:
+            enable = self.hwmon / f"pwm{idx}_enable"
+            try:
+                sysfs_write(enable, "2")
+                log(f"restored BIOS auto on pwm{idx}")
+            except OSError as exc:
+                log(f"could not restore pwm{idx}_enable: {exc}")
+
+    def run(self) -> int:
+        log(
+            f"it8688={self.hwmon} pwm={self.pwms} "
+            f"curve={self.tmin:.0f}C@{self.pwm_min}..{self.tmax:.0f}C@{self.pwm_max}"
+        )
+        while not self._stop:
+            try:
+                temps = xpu_temps(self.xpu_smi)
+                t = max(temps)
+                target = duty_for_temp(t, self.tmin, self.tmax, self.pwm_min, self.pwm_max)
+                if self.applied is not None and abs(target - self.applied) <= max(1, int(self.hyst)):
+                    target = self.applied
+                self.set_duty(target, f"xpu={t}C temps={temps}")
+            except Exception as exc:  # noqa: BLE001 — fail-safe is the point
+                log(f"failsafe ({exc})")
+                try:
+                    self.set_duty(self.failsafe, "failsafe")
+                except OSError as pwm_exc:
+                    log(f"could not apply failsafe pwm: {pwm_exc}")
+            # Sleep in slices so SIGTERM is not stuck behind INTERVAL.
+            end = time.monotonic() + self.interval
+            while not self._stop and time.monotonic() < end:
+                time.sleep(0.2)
+        self.restore_bios()
+        return 0
+
+
+def main() -> int:
+    cfg = load_conf()
+    if len(sys.argv) > 1 and sys.argv[1] in ("-n", "--status"):
+        hw = find_it8688()
+        print(f"hwmon {hw}")
+        for i in range(1, 6):
+            pwm = sysfs_read(hw / f"pwm{i}")
+            en = sysfs_read(hw / f"pwm{i}_enable")
+            rpm = sysfs_read(hw / f"fan{i}_input")
+            print(f"  pwm{i} duty={pwm} enable={en} rpm={rpm}")
+        try:
+            temps = xpu_temps(cfg["XPU_SMI"])
+            print(f"  xpu temps={temps} max={max(temps)}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  xpu temps unavailable: {exc}")
+        return 0
+    ctl = FanController(cfg)
+    signal.signal(signal.SIGTERM, ctl.request_stop)
+    signal.signal(signal.SIGINT, ctl.request_stop)
+    return ctl.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

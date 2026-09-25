@@ -1,0 +1,195 @@
+#include "cdnn_ref.h"
+
+// Dual-DMA-port INT8 pipe. B resident in L1W (full K,N). Each 32-row A tile is
+// split across both DMA ports and both shuffles (rows 0-15 via L2_0/DS_0,
+// rows 16-31 via L2_1/DS_1), and K is walked in 2048-wide slices accumulated
+// in L1E. At K=4096 the store amortises over 2x compute, so the two A ports
+// can feed the array toward the MAC ceiling.
+//   core 0 DMAIN_0  A rows [m,m+16) all slices -> L2_0
+//   core 1 DMAIN_1  A rows [m+16,m+32) all slices-> L2_1
+//   core 3 DS_0     L2_0 -> L1D plane 0    core 4 DS_1  L2_1 -> L1D plane 1
+//   core 2 MAC      slice 0 mm_int8, slice s>0 mm_acc_int8 -> L1E
+//   core 5 EW, core 6 RS, core 7 DMAOUT   (1 tile/step)
+// Requires mm==32, K%2048==0, K<=4096 (B<=2MB L1W), grid 4x8, inner_reps==1.
+
+static const int KSLICE = 2048;
+
+static inline __device__ int my_engine(int cid) {
+    if (cid == 0) return DMAIN_0;
+    if (cid == 1) return DMAIN_1;
+    if (cid == 2) return MAC;
+    if (cid == 3) return DS_0;
+    if (cid == 4) return DS_1;
+    if (cid == 5) return EW;
+    if (cid == 6) return RS;
+    if (cid == 7) return DMAOUT;
+    return -1;
+}
+
+static inline __device__ _global_ptr_ const int8_t* b_panel(
+    _global_ptr_ const int8_t* B, int n0, int nn, int k_bytes) {
+    int panel = n0 / nn;
+    return gptr_i8(B, (long long)panel * k_bytes * nn);
+}
+
+// Load rows [0,half_rows) of every K-slice for this tile into one L2 bank via
+// a 2D DMA per slice (16 rows of KSLICE bytes, source row-stride K).
+static inline __device__ void issue_dma_half(_global_ptr_ const int8_t* Arow0, int l2sel,
+                                             int l2_base, int nk, int half_rows, int K) {
+    for (int s = 0; s < nk; s++) {
+        int8_t* l2 = (int8_t*)0 + l2_base + s * (half_rows * KSLICE);
+        _global_ptr_ const int8_t* gm = gptr_i8(Arow0, (long long)s * KSLICE);
+        dma_cfg((l2sel | DMA_INT8), (DMA_GM | DMA_INT8 | highptr(gm)), 0.0f);
+        dma_cfg_2d(half_rows, KSLICE, K);
+        dma_i_2d(l2, lowptr(gm), KSLICE);
+    }
+}
+
+// Shuffle every K-slice's 16 rows from this engine's L2 bank into L1D plane.
+static inline __device__ void issue_ds_half(int l2_base, v32i8* l1, int plane, int nk,
+                                            int half_rows, int d_slice) {
+    ds_shuffle_cfg_datatype(DS_INT8);
+    ds_shuffle_cfg_blkx(KSLICE);
+    ds_cfg_output_bank(NBANKS);
+    for (int s = 0; s < nk; s++) {
+        int8_t* l2 = (int8_t*)0 + l2_base + s * (half_rows * KSLICE);
+        ds_shuffle_batch(&l1[s * d_slice][plane], l2, KSLICE, DS_L1D);
+    }
+}
+
+static inline __device__ void issue_mac(int N, int nn_tile, int nstrips, int mm, int nk,
+                                        int l1w_dim, int w_stride, int a_off, int d_slice,
+                                        v16f32* l1e) {
+    mm_cfg_stride(1);
+    mm_cfg_dequant_scale(1.0f);
+    for (int s = 0; s < nk; s++) {
+        v32i8* l1d = &((v32i8*)0)[a_off + s * d_slice];
+        mm_cfg_basic_int8(KSLICE, mm, mm);
+        for (int n0 = 0; n0 < N; n0 += nn_tile) {
+            v32i8* l1w = &((v32i8*)0)[(n0 / nn_tile) * w_stride + s * KSLICE];
+            int base = (n0 / 32) * mm * 2;
+            for (int ns = 0; ns < nstrips; ns++) {
+                if (s == 0)
+                    mm_int8(&l1e[base + ns * mm * 2], l1d, &l1w[ns * l1w_dim]);
+                else
+                    mm_acc_int8(&l1e[base + ns * mm * 2], l1d, &l1w[ns * l1w_dim]);
+            }
+        }
+    }
+}
+
+static inline __device__ void issue_ew(v16f32* l1e, v16f32* l2e, int mm, int nn) {
+    int nblocks = roundup_div16(nn);
+    ew_cfg_activation_type(EW_NOACT);
+    ew_cfg_coeff_scalar(1.0f, 0.0f, 0.0f);
+    ew_cfg_findmax(0, 0.0f);
+    ew_cfg_stream_size(mm * nblocks);
+    ew_cfg_col_size(NBANKS);
+    ew_dsmadd(l2e, l1e, l1e, EW_L2E);
+}
+
+static inline __device__ void issue_rs(v16f32* l2e, v16f32* l2r, int mm, int nn) {
+    int nblocks = roundup_div16(nn);
+    rs_row_cfg_stride(1, nblocks);
+    rs_row_cfg_loop(mm);
+    for (int i = 0; i < nblocks; i++) {
+        rs_row_batch(&l2r[i][0], &l2e[i * mm][0], NBANKS);
+    }
+}
+
+static inline __device__ void issue_dmaout(_global_ptr_ float* gm, v16f32* l2r, int mm, int nn,
+                                           int ld) {
+    dma_cfg((DMA_GM | DMA_FP32 | highptr(gm)), (DMA_L2R | DMA_FP32), 0.0f);
+    dma_cfg_2d(mm, ld * (int)sizeof(float), roundup16(nn) * (int)sizeof(float));
+    dma_o_2d(lowptr(gm), l2r, nn * (int)sizeof(float));
+}
+
+__global__ void cdnn_mac_int8_pipe2(float* C, const int8_t* A, const int8_t* B,
+                                    int M, int N, int K, int mm, int nn_tile,
+                                    int k_tile, int inner_reps) {
+    int cid = core_id();
+    int ncores = core_num();
+    if (cid >= ncores || ncores < 8 || inner_reps != 1 || k_tile != K || mm != 32 ||
+        (K % KSLICE) != 0 || K > 4096) {
+        return;
+    }
+    int nk = K / KSLICE;
+    int ncl = cluster_num();
+    int cl = cluster_id();
+    if (ncl < 1)
+        ncl = 1;
+    int rows_per = M / ncl;
+    int m0 = cl * rows_per;
+    int m1 = m0 + rows_per;
+    int k_bytes = K;
+    int half_rows = mm / 2;
+    int l2_span = nk * half_rows * KSLICE;      // per L2 bank, per buffer
+    int l1w_dim = roundup16(k_bytes);
+    int nstrips = roundup_div32(nn_tile);
+    int w_stride = nstrips * l1w_dim;
+    int d_slice = roundup16(KSLICE);            // v32i8 per K-slice in L1D
+    int d_stride = nk * d_slice;                // per tile buffer
+    int l1e_stride = (N / 32) * mm * 2;
+    int l2e_stride = roundup_div16(N) * mm;
+
+    if (cid == 0) {
+        for (int n0 = 0; n0 < N; n0 += nn_tile) {
+            _global_ptr_ const int8_t* Bp = b_panel(B, n0, nn_tile, k_bytes);
+            v32i8* dst = &((v32i8*)0)[(n0 / nn_tile) * w_stride];
+            load_int8_b_panel(Bp, k_bytes, nn_tile, nn_tile, dst);
+        }
+    }
+    sync();
+
+    int ntiles = (m0 < m1) ? (m1 - m0) / mm : 0;
+    int mydev = my_engine(cid);
+    int held = 0;
+    int steps = ntiles + 5;
+    for (int step = 0; step < steps; step++) {
+        if (held) {
+            xfence_unlock(mydev);
+            held = 0;
+        }
+        sync();
+        int tile = -1;
+        if (cid == 0 || cid == 1) tile = step;
+        else if (cid == 3 || cid == 4) tile = step - 1;
+        else if (cid == 2) tile = step - 2;
+        else if (cid == 5) tile = step - 3;
+        else if (cid == 6) tile = step - 4;
+        else if (cid == 7) tile = step - 5;
+        if (tile < 0 || tile >= ntiles || mydev < 0) {
+            continue;
+        }
+        int buf = tile & 1;
+        int m = m0 + tile * mm;
+        xfence_lock(mydev);
+        if (cid == 0) {
+            issue_dma_half(gptr_i8(A, (long long)m * K), DMA_L2_0, buf * l2_span,
+                           nk, half_rows, K);
+        } else if (cid == 1) {
+            issue_dma_half(gptr_i8(A, (long long)(m + half_rows) * K), DMA_L2_1,
+                           buf * l2_span, nk, half_rows, K);
+        } else if (cid == 3) {
+            issue_ds_half(buf * l2_span, &((v32i8*)0)[buf * d_stride], 0, nk, half_rows,
+                          d_slice);
+        } else if (cid == 4) {
+            issue_ds_half(buf * l2_span, &((v32i8*)0)[buf * d_stride], 1, nk, half_rows,
+                          d_slice);
+        } else if (cid == 2) {
+            issue_mac(N, nn_tile, nstrips, mm, nk, l1w_dim, w_stride, buf * d_stride,
+                      d_slice, &((v16f32*)0)[buf * l1e_stride]);
+        } else if (cid == 5) {
+            issue_ew(&((v16f32*)0)[buf * l1e_stride], &((v16f32*)0)[buf * l2e_stride], mm, N);
+        } else if (cid == 6) {
+            issue_rs(&((v16f32*)0)[buf * l2e_stride], (v16f32*)(buf * 65536), mm, N);
+        } else if (cid == 7) {
+            issue_dmaout(gptr_f32(C, (long long)m * N), (v16f32*)(buf * 65536), mm, N, N);
+        }
+        held = 1;
+    }
+    if (held) {
+        xfence_unlock(mydev);
+    }
+    sync();
+}

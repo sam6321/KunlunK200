@@ -1,0 +1,11 @@
+.ci-vendor/
+bench/out/
+build/
+*.o
+*.bin
+*.device.o
+*.linked.elf
+*.entry
+*.kind
+*.s
+!third_party/**/*.s

@@ -1,0 +1,18 @@
+// KL1 cluster SIMD smoke: 256-bit FP32 vector add on local memory.
+#include "xpu/kernel/cluster_header.h"
+#include "xpu/kernel/simd.h"
+
+__global__ void simd_vvadd(float* y, const float* a, const float* b, int n) {
+    if (core_id() != 0 || cluster_id() != 0) {
+        return;
+    }
+    __local__ float la[8];
+    __local__ float lb[8];
+    __local__ float lc[8];
+    for (int i = 0; i < n; i += 8) {
+        GM2LM(a + i, la, 32);
+        GM2LM(b + i, lb, 32);
+        _x256_vvadd_ls(la, lb, lc);
+        LM2GM(lc, y + i, 32);
+    }
+}

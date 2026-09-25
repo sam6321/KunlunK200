@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Set the core PLL. HBM stays at 1000 MHz. 1300 and above are refused.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+PLL="${PLL:-$ROOT/k200-pll}"
+if [[ ! -x "$PLL" ]]; then
+  echo "missing $PLL (run clock/compile.sh)" >&2
+  exit 1
+fi
+mhz="${1:-}"
+case "$mhz" in
+  900) word=0x66c1 ;;
+  1000) word=0x6781 ;;
+  1050) word=0x67e1 ;;
+  1100) word=0x6841 ;;
+  1150) word=0x68a1 ;;
+  1200) word=0x6901 ;;
+  1250) word=0x6961 ;;
+  "") echo "usage: $0 <900|1000|1050|1100|1150|1200|1250>" >&2; exit 2 ;;
+  *) echo "refusing $mhz MHz. 1300 faulted the card. Everyday clock is 900." >&2; exit 2 ;;
+esac
+"$PLL" set "$word"

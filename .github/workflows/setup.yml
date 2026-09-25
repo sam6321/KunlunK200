@@ -1,0 +1,28 @@
+name: setup
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  userspace:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache vendor archives
+        uses: actions/cache@v4
+        with:
+          path: .ci-vendor
+          key: k200-xre-4.33-xpu-sdk-2.0.0.61
+
+      - name: Shell syntax
+        run: |
+          shopt -s nullglob
+          for f in setup/*.sh clock/*.sh bench/*.sh bench/profiles/*.sh docker/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: Install and compile inside Ubuntu 22.04
+        run: bash docker/ci.sh

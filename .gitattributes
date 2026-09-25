@@ -1,0 +1,3 @@
+*.sh text eol=lf
+k200-fancontrol text eol=lf
+set-mhz text eol=lf

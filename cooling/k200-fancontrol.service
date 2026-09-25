@@ -1,0 +1,13 @@
+[Unit]
+Description=K200 die-temperature fan curve
+After=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStartPre=/sbin/modprobe it87
+ExecStart=/usr/local/sbin/k200-fancontrol
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
